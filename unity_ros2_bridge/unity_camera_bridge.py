@@ -16,7 +16,7 @@ from sensor_msgs.msg import CompressedImage
 from spot_msgs.msg import Feedback, PowerState
 from std_msgs.msg import Bool
 from std_srvs.srv import Trigger
-from tf2_ros import TransformBroadcaster
+from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
 
 
 HEADER_SIZE = 4
@@ -59,6 +59,10 @@ class UnitySpotBridge(Node):
         self.declare_parameter("odom_frame_id", "spot/odom")
         self.declare_parameter("body_frame_id", "spot/body")
         self.declare_parameter("tf_root", "odom")
+        self.declare_parameter("map_frame_id", "map")
+        self.declare_parameter("lamp_base_frame_id", "lamp_base_link")
+        self.declare_parameter("lamp_mount_xyz", [0.0, 0.0, 0.25])
+        self.declare_parameter("lamp_mount_rpy", [math.pi, 0.0, 0.0])
         self.declare_parameter("max_payload_bytes", 5 * 1024 * 1024)
         self.declare_parameter("command_timeout_seconds", 2.0)
 
@@ -79,6 +83,12 @@ class UnitySpotBridge(Node):
             self.get_parameter("body_frame_id").value
         ).lstrip("/")
         self._tf_root = str(self.get_parameter("tf_root").value).strip("/")
+        self._map_frame_id = str(self.get_parameter("map_frame_id").value).lstrip("/")
+        self._lamp_base_frame_id = str(
+            self.get_parameter("lamp_base_frame_id").value
+        ).lstrip("/")
+        self._lamp_mount_xyz = self._get_vector_parameter("lamp_mount_xyz")
+        self._lamp_mount_rpy = self._get_vector_parameter("lamp_mount_rpy")
         self._max_payload_bytes = int(
             self.get_parameter("max_payload_bytes").value
         )
@@ -91,6 +101,10 @@ class UnitySpotBridge(Node):
             raise ValueError("command_timeout_seconds must be positive")
         if self._tf_root not in ("odom", "vision", "body"):
             raise ValueError("tf_root must be one of: odom, vision, body")
+        if not self._map_frame_id:
+            raise ValueError("map_frame_id must not be empty")
+        if not self._lamp_base_frame_id:
+            raise ValueError("lamp_base_frame_id must not be empty")
 
         camera_topic = self._spot_topic(
             str(self.get_parameter("camera_topic").value)
@@ -119,6 +133,7 @@ class UnitySpotBridge(Node):
             PowerState, self._spot_topic("status/power_states"), 1
         )
         self._tf_broadcaster = TransformBroadcaster(self)
+        self._static_tf_broadcaster = StaticTransformBroadcaster(self)
         self._velocity_subscription = self.create_subscription(
             Twist, self._spot_topic("cmd_vel"), self._velocity_callback, 1
         )
@@ -167,6 +182,55 @@ class UnitySpotBridge(Node):
         self._camera_thread.start()
         self._control_thread.start()
         self._lease_publisher.publish(Bool(data=False))
+        self._publish_static_transforms()
+
+    def _get_vector_parameter(self, name: str) -> Tuple[float, float, float]:
+        value = self.get_parameter(name).value
+        if len(value) != 3:
+            raise ValueError(f"{name} must have exactly 3 values")
+        return float(value[0]), float(value[1]), float(value[2])
+
+    def _tf_root_frame_id(self) -> str:
+        if self._tf_root == "odom":
+            return self._odom_frame_id
+        if self._tf_root == "vision":
+            return self._vision_frame_id
+        return self._body_frame_id
+
+    def _publish_static_transforms(self) -> None:
+        stamp = self.get_clock().now().to_msg()
+        map_to_tf_root = self._make_transform(
+            stamp,
+            self._map_frame_id,
+            self._tf_root_frame_id(),
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+        )
+        lamp_qx, lamp_qy, lamp_qz, lamp_qw = self._quaternion_from_rpy(
+            *self._lamp_mount_rpy
+        )
+        body_to_lamp = self._make_transform(
+            stamp,
+            self._body_frame_id,
+            self._lamp_base_frame_id,
+            self._lamp_mount_xyz[0],
+            self._lamp_mount_xyz[1],
+            self._lamp_mount_xyz[2],
+            lamp_qx,
+            lamp_qy,
+            lamp_qz,
+            lamp_qw,
+        )
+        self._static_tf_broadcaster.sendTransform([map_to_tf_root, body_to_lamp])
+        self.get_logger().info(
+            f"Published static TFs: {self._map_frame_id}->{self._tf_root_frame_id()} "
+            f"and {self._body_frame_id}->{self._lamp_base_frame_id}"
+        )
 
     @staticmethod
     def _normalize_quaternion(
@@ -176,6 +240,23 @@ class UnitySpotBridge(Node):
         if norm <= 1.0e-9:
             return 0.0, 0.0, 0.0, 1.0
         return x / norm, y / norm, z / norm, w / norm
+
+    @staticmethod
+    def _quaternion_from_rpy(
+        roll: float, pitch: float, yaw: float
+    ) -> Tuple[float, float, float, float]:
+        cr = math.cos(roll * 0.5)
+        sr = math.sin(roll * 0.5)
+        cp = math.cos(pitch * 0.5)
+        sp = math.sin(pitch * 0.5)
+        cy = math.cos(yaw * 0.5)
+        sy = math.sin(yaw * 0.5)
+        return UnitySpotBridge._normalize_quaternion(
+            sr * cp * cy - cr * sp * sy,
+            cr * sp * cy + sr * cp * sy,
+            cr * cp * sy - sr * sp * cy,
+            cr * cp * cy + sr * sp * sy,
+        )
 
     @staticmethod
     def _inverse_transform(transform: TransformStamped) -> TransformStamped:

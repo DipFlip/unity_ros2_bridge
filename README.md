@@ -18,10 +18,12 @@ bidirectional command/state messages on port 50052. Defaults are:
 - State: `/spot/odometry`, `/spot/odometry/twist`,
   `/spot/status/local_lease`, `/spot/status/feedback`, and
   `/spot/status/power_states`.
-- TF: `spot/odom -> spot/vision` and `spot/odom -> spot/body` by default,
-  matching the official driver's default `tf_root:=odom`. Set `tf_root` to
-  `vision` or `body` to invert the tree the same way the driver does. Unity's
-  starting robot pose is the identity of both world frames.
+- TF: `map -> spot/odom -> spot/body -> lamp_base_link`, plus
+  `spot/odom -> spot/vision`, by default. This matches the UI/Spot pipeline:
+  Unity's perfect global pose takes the role normally provided by cartographer's
+  `map` frame, and `lamp_base_link` is fixed to Spot's body with the standard
+  Spot LAMP mount (`xyz=[0,0,0.25]`, `rpy=[pi,0,0]`). Set `tf_root` to
+  `vision` or `body` to invert the Spot subtree the same way the driver does.
 - Camera: `/spot/camera/image/compressed`.
 
 `take_lease` maps to Unity's internal `claim` command so the ROS API matches
