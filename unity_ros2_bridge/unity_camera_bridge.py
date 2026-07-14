@@ -58,6 +58,7 @@ class UnitySpotBridge(Node):
         self.declare_parameter("vision_frame_id", "spot/vision")
         self.declare_parameter("odom_frame_id", "spot/odom")
         self.declare_parameter("body_frame_id", "spot/body")
+        self.declare_parameter("tf_root", "odom")
         self.declare_parameter("max_payload_bytes", 5 * 1024 * 1024)
         self.declare_parameter("command_timeout_seconds", 2.0)
 
@@ -77,6 +78,7 @@ class UnitySpotBridge(Node):
         self._body_frame_id = str(
             self.get_parameter("body_frame_id").value
         ).lstrip("/")
+        self._tf_root = str(self.get_parameter("tf_root").value).strip("/")
         self._max_payload_bytes = int(
             self.get_parameter("max_payload_bytes").value
         )
@@ -87,6 +89,8 @@ class UnitySpotBridge(Node):
             raise ValueError("max_payload_bytes must be positive")
         if self._command_timeout <= 0:
             raise ValueError("command_timeout_seconds must be positive")
+        if self._tf_root not in ("odom", "vision", "body"):
+            raise ValueError("tf_root must be one of: odom, vision, body")
 
         camera_topic = self._spot_topic(
             str(self.get_parameter("camera_topic").value)
@@ -163,6 +167,59 @@ class UnitySpotBridge(Node):
         self._camera_thread.start()
         self._control_thread.start()
         self._lease_publisher.publish(Bool(data=False))
+
+    @staticmethod
+    def _normalize_quaternion(
+        x: float, y: float, z: float, w: float
+    ) -> Tuple[float, float, float, float]:
+        norm = math.sqrt(x * x + y * y + z * z + w * w)
+        if norm <= 1.0e-9:
+            return 0.0, 0.0, 0.0, 1.0
+        return x / norm, y / norm, z / norm, w / norm
+
+    @staticmethod
+    def _inverse_transform(transform: TransformStamped) -> TransformStamped:
+        inverse = TransformStamped()
+        inverse.header.stamp = transform.header.stamp
+        inverse.header.frame_id = transform.child_frame_id
+        inverse.child_frame_id = transform.header.frame_id
+
+        qx = transform.transform.rotation.x
+        qy = transform.transform.rotation.y
+        qz = transform.transform.rotation.z
+        qw = transform.transform.rotation.w
+        tx = transform.transform.translation.x
+        ty = transform.transform.translation.y
+        tz = transform.transform.translation.z
+
+        inverse.transform.rotation.x = -qx
+        inverse.transform.rotation.y = -qy
+        inverse.transform.rotation.z = -qz
+        inverse.transform.rotation.w = qw
+
+        # Inverse translation is -(R^-1 * t), using the conjugate quaternion.
+        ix, iy, iz = UnitySpotBridge._rotate_vector(-qx, -qy, -qz, qw, tx, ty, tz)
+        inverse.transform.translation.x = -ix
+        inverse.transform.translation.y = -iy
+        inverse.transform.translation.z = -iz
+        return inverse
+
+    @staticmethod
+    def _rotate_vector(
+        qx: float, qy: float, qz: float, qw: float, x: float, y: float, z: float
+    ) -> Tuple[float, float, float]:
+        # Quaternion-vector multiplication, expanded to avoid extra dependencies.
+        uvx = qy * z - qz * y
+        uvy = qz * x - qx * z
+        uvz = qx * y - qy * x
+        uuvx = qy * uvz - qz * uvy
+        uuvy = qz * uvx - qx * uvz
+        uuvz = qx * uvy - qy * uvx
+        return (
+            x + 2.0 * (qw * uvx + uuvx),
+            y + 2.0 * (qw * uvy + uuvy),
+            z + 2.0 * (qw * uvz + uuvz),
+        )
 
     def _spot_topic(self, relative_name: str) -> str:
         relative_name = relative_name.strip("/")
@@ -315,12 +372,75 @@ class UnitySpotBridge(Node):
                     self._pending[request_id] = (pending[0], message)
                     pending[0].set()
 
+    def _state_quaternion(self, state: Dict[str, Any]) -> Tuple[float, float, float, float]:
+        if "qw" in state:
+            return self._normalize_quaternion(
+                float(state.get("qx", 0.0)),
+                float(state.get("qy", 0.0)),
+                float(state.get("qz", 0.0)),
+                float(state.get("qw", 1.0)),
+            )
+
+        yaw = float(state.get("yaw", 0.0))
+        half_yaw = yaw * 0.5
+        return 0.0, 0.0, math.sin(half_yaw), math.cos(half_yaw)
+
+    def _state_vision_transform(
+        self, state: Dict[str, Any]
+    ) -> Tuple[float, float, float, float, float, float, float]:
+        return (
+            float(state.get("vision_x", 0.0)),
+            float(state.get("vision_y", 0.0)),
+            float(state.get("vision_z", 0.0)),
+            *self._normalize_quaternion(
+                float(state.get("vision_qx", 0.0)),
+                float(state.get("vision_qy", 0.0)),
+                float(state.get("vision_qz", 0.0)),
+                float(state.get("vision_qw", 1.0)),
+            ),
+        )
+
+    @staticmethod
+    def _make_transform(
+        stamp,
+        parent_frame_id: str,
+        child_frame_id: str,
+        x: float,
+        y: float,
+        z: float,
+        qx: float,
+        qy: float,
+        qz: float,
+        qw: float,
+    ) -> TransformStamped:
+        transform = TransformStamped()
+        transform.header.stamp = stamp
+        transform.header.frame_id = parent_frame_id
+        transform.child_frame_id = child_frame_id
+        transform.transform.translation.x = x
+        transform.transform.translation.y = y
+        transform.transform.translation.z = z
+        transform.transform.rotation.x = qx
+        transform.transform.rotation.y = qy
+        transform.transform.rotation.z = qz
+        transform.transform.rotation.w = qw
+        return transform
+
     def _publish_pose(self, state: Dict[str, Any]) -> None:
         stamp = self.get_clock().now().to_msg()
         x = float(state.get("x", 0.0))
         y = float(state.get("y", 0.0))
         z = float(state.get("z", 0.0))
-        yaw = float(state.get("yaw", 0.0))
+        qx, qy, qz, qw = self._state_quaternion(state)
+        (
+            vision_x,
+            vision_y,
+            vision_z,
+            vision_qx,
+            vision_qy,
+            vision_qz,
+            vision_qw,
+        ) = self._state_vision_transform(state)
         vx = float(state.get("vx", 0.0))
         vy = float(state.get("vy", 0.0))
         wz = float(state.get("wz", 0.0))
@@ -352,10 +472,6 @@ class UnitySpotBridge(Node):
         power.locomotion_charge_percentage = 100.0
         self._power_publisher.publish(power)
 
-        half_yaw = yaw * 0.5
-        qz = math.sin(half_yaw)
-        qw = math.cos(half_yaw)
-
         odometry = Odometry()
         odometry.header.stamp = stamp
         odometry.header.frame_id = self._odom_frame_id
@@ -363,6 +479,8 @@ class UnitySpotBridge(Node):
         odometry.pose.pose.position.x = x
         odometry.pose.pose.position.y = y
         odometry.pose.pose.position.z = z
+        odometry.pose.pose.orientation.x = qx
+        odometry.pose.pose.orientation.y = qy
         odometry.pose.pose.orientation.z = qz
         odometry.pose.pose.orientation.w = qw
         odometry.twist.twist.linear.x = vx
@@ -376,22 +494,40 @@ class UnitySpotBridge(Node):
         twist.twist = odometry.twist
         self._twist_publisher.publish(twist)
 
-        vision_to_odom = TransformStamped()
-        vision_to_odom.header.stamp = stamp
-        vision_to_odom.header.frame_id = self._vision_frame_id
-        vision_to_odom.child_frame_id = self._odom_frame_id
-        vision_to_odom.transform.rotation.w = 1.0
-
-        odom_to_body = TransformStamped()
-        odom_to_body.header.stamp = stamp
-        odom_to_body.header.frame_id = self._odom_frame_id
-        odom_to_body.child_frame_id = self._body_frame_id
-        odom_to_body.transform.translation.x = x
-        odom_to_body.transform.translation.y = y
-        odom_to_body.transform.translation.z = z
-        odom_to_body.transform.rotation.z = qz
-        odom_to_body.transform.rotation.w = qw
-        self._tf_broadcaster.sendTransform([vision_to_odom, odom_to_body])
+        odom_to_vision = self._make_transform(
+            stamp,
+            self._odom_frame_id,
+            self._vision_frame_id,
+            vision_x,
+            vision_y,
+            vision_z,
+            vision_qx,
+            vision_qy,
+            vision_qz,
+            vision_qw,
+        )
+        odom_to_body = self._make_transform(
+            stamp,
+            self._odom_frame_id,
+            self._body_frame_id,
+            x,
+            y,
+            z,
+            qx,
+            qy,
+            qz,
+            qw,
+        )
+        if self._tf_root == "odom":
+            self._tf_broadcaster.sendTransform([odom_to_vision, odom_to_body])
+        elif self._tf_root == "vision":
+            self._tf_broadcaster.sendTransform(
+                [self._inverse_transform(odom_to_vision), odom_to_body]
+            )
+        else:
+            self._tf_broadcaster.sendTransform(
+                [self._inverse_transform(odom_to_body), odom_to_vision]
+            )
 
     def _velocity_callback(self, message: Twist) -> None:
         self._send_json(
