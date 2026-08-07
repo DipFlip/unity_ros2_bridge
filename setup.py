@@ -25,6 +25,7 @@ setup(
         "console_scripts": [
             "unity_camera_bridge = unity_ros2_bridge.unity_camera_bridge:main",
             "unity_spot_bridge = unity_ros2_bridge.unity_camera_bridge:main",
+            "unity_lidar_mapper = unity_ros2_bridge.unity_lidar_mapper:main",
         ],
     },
 )

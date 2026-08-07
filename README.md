@@ -9,8 +9,9 @@ Run the node before entering Play mode in Unity:
 ros2 run unity_ros2_bridge unity_spot_bridge
 ```
 
-The bridge listens for the existing JPEG stream on TCP port 50051 and for
-bidirectional command/state messages on port 50052. Defaults are:
+The bridge listens for the existing JPEG stream on TCP port 50051, for
+bidirectional command/state messages on port 50052, and for packed synthetic
+lidar scans on port 50053. Defaults are:
 
 - Services: `/spot/take_lease`, `/spot/release`, `/spot/power_on`,
   `/spot/power_off`, `/spot/stand`, `/spot/sit`, and `/spot/stop`.
@@ -18,13 +19,24 @@ bidirectional command/state messages on port 50052. Defaults are:
 - State: `/spot/odometry`, `/spot/odometry/twist`,
   `/spot/status/local_lease`, `/spot/status/feedback`, and
   `/spot/status/power_states`.
-- TF: `map -> spot/odom -> spot/body -> lamp_base_link`, plus
-  `spot/odom -> spot/vision`, by default. This matches the UI/Spot pipeline:
-  Unity's perfect global pose takes the role normally provided by cartographer's
-  `map` frame, and `lamp_base_link` is fixed to Spot's body with the standard
-  Spot LAMP mount (`xyz=[0,0,0.25]`, `rpy=[pi,0,0]`). Set `tf_root` to
-  `vision` or `body` to invert the Spot subtree the same way the driver does.
+- TF: `map -> spot/odom -> spot/body`, with fixed `spot/body -> lamp_base_link`
+  and `spot/body -> spot/lidar` mounts, plus `spot/odom -> spot/vision`.
+  Unity's perfect global pose takes the role normally provided by localization's
+  `map` transform. The simulation does not publish the deployment-specific
+  `map_ground` or `spot/odom_ground` convenience frames: `/map`, Nav2 goals,
+  plans, and UI poses all use canonical `map` coordinates, while the local
+  costmap uses `spot/odom`. `lamp_base_link` is fixed to Spot's body with the
+  standard Spot LAMP mount (`xyz=[0,0,0.25]`, `rpy=[pi,0,0]`). Set `tf_root`
+  to `vision` or `body` to invert the Spot subtree the same way the driver does.
 - Camera: `/spot/camera/image/compressed`.
+- Lidar: `/spot/nav2_points_fused` (`sensor_msgs/msg/PointCloud2`, best effort,
+  `spot/lidar` frame). Unity sends packed ranges and the `Lidar` GameObject's
+  body-relative pose; the bridge reconstructs XYZ points and publishes the
+  corresponding TF without JSON or base64 overhead.
+- Occupancy map: `unity_lidar_mapper` ray-traces the simulated point cloud using
+  Unity's perfect `map -> spot/lidar` transform and publishes a persistent
+  `nav_msgs/msg/OccupancyGrid` on `/map`. This provides Cartographer-compatible
+  map output without running a second localization estimate in the simulation.
 
 `take_lease` maps to Unity's internal `claim` command so the ROS API matches
 the real Spot driver while the Unity scene can keep its local naming.

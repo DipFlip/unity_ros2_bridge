@@ -12,7 +12,7 @@ from geometry_msgs.msg import TransformStamped, Twist, TwistWithCovarianceStampe
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
-from sensor_msgs.msg import CompressedImage
+from sensor_msgs.msg import CompressedImage, PointCloud2, PointField
 from spot_msgs.msg import Feedback, PowerState
 from std_msgs.msg import Bool
 from std_srvs.srv import Trigger
@@ -20,6 +20,10 @@ from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
 
 
 HEADER_SIZE = 4
+LIDAR_MAGIC = b"ULDR"
+LIDAR_VERSION = 1
+LIDAR_HEADER = struct.Struct("<4sHHIHHfffffffffffff")
+POINT_XYZ = struct.Struct("<fff")
 
 
 class InvalidFrameError(Exception):
@@ -52,23 +56,27 @@ class UnitySpotBridge(Node):
         self.declare_parameter("listen_host", "0.0.0.0")
         self.declare_parameter("camera_port", 50051)
         self.declare_parameter("control_port", 50052)
+        self.declare_parameter("lidar_port", 50053)
         self.declare_parameter("spot_name", "spot")
         self.declare_parameter("camera_topic", "camera/image/compressed")
         self.declare_parameter("camera_frame_id", "spot/camera_optical_frame")
         self.declare_parameter("vision_frame_id", "spot/vision")
         self.declare_parameter("odom_frame_id", "spot/odom")
         self.declare_parameter("body_frame_id", "spot/body")
+        self.declare_parameter("lidar_frame_id", "spot/lidar")
         self.declare_parameter("tf_root", "odom")
         self.declare_parameter("map_frame_id", "map")
         self.declare_parameter("lamp_base_frame_id", "lamp_base_link")
         self.declare_parameter("lamp_mount_xyz", [0.0, 0.0, 0.25])
         self.declare_parameter("lamp_mount_rpy", [math.pi, 0.0, 0.0])
         self.declare_parameter("max_payload_bytes", 5 * 1024 * 1024)
+        self.declare_parameter("max_lidar_payload_bytes", 1024 * 1024)
         self.declare_parameter("command_timeout_seconds", 2.0)
 
         self._listen_host = str(self.get_parameter("listen_host").value)
         self._camera_port = int(self.get_parameter("camera_port").value)
         self._control_port = int(self.get_parameter("control_port").value)
+        self._lidar_port = int(self.get_parameter("lidar_port").value)
         self._spot_name = str(self.get_parameter("spot_name").value).strip("/")
         self._camera_frame_id = str(
             self.get_parameter("camera_frame_id").value
@@ -82,6 +90,9 @@ class UnitySpotBridge(Node):
         self._body_frame_id = str(
             self.get_parameter("body_frame_id").value
         ).lstrip("/")
+        self._lidar_frame_id = str(
+            self.get_parameter("lidar_frame_id").value
+        ).lstrip("/")
         self._tf_root = str(self.get_parameter("tf_root").value).strip("/")
         self._map_frame_id = str(self.get_parameter("map_frame_id").value).lstrip("/")
         self._lamp_base_frame_id = str(
@@ -92,17 +103,24 @@ class UnitySpotBridge(Node):
         self._max_payload_bytes = int(
             self.get_parameter("max_payload_bytes").value
         )
+        self._max_lidar_payload_bytes = int(
+            self.get_parameter("max_lidar_payload_bytes").value
+        )
         self._command_timeout = float(
             self.get_parameter("command_timeout_seconds").value
         )
         if self._max_payload_bytes <= 0:
             raise ValueError("max_payload_bytes must be positive")
+        if self._max_lidar_payload_bytes < LIDAR_HEADER.size + 4:
+            raise ValueError("max_lidar_payload_bytes is too small for one ray")
         if self._command_timeout <= 0:
             raise ValueError("command_timeout_seconds must be positive")
         if self._tf_root not in ("odom", "vision", "body"):
             raise ValueError("tf_root must be one of: odom, vision, body")
         if not self._map_frame_id:
             raise ValueError("map_frame_id must not be empty")
+        if not self._lidar_frame_id:
+            raise ValueError("lidar_frame_id must not be empty")
         if not self._lamp_base_frame_id:
             raise ValueError("lamp_base_frame_id must not be empty")
 
@@ -117,6 +135,9 @@ class UnitySpotBridge(Node):
         self._camera_publisher = self.create_publisher(
             CompressedImage, camera_topic, best_effort_qos
         )
+        self._lidar_publisher = self.create_publisher(
+            PointCloud2, self._spot_topic("nav2_points_fused"), best_effort_qos
+        )
         self._odom_publisher = self.create_publisher(
             Odometry, self._spot_topic("odometry"), 1
         )
@@ -125,6 +146,9 @@ class UnitySpotBridge(Node):
         )
         self._lease_publisher = self.create_publisher(
             Bool, self._spot_topic("status/local_lease"), 1
+        )
+        self._lease_held_publisher = self.create_publisher(
+            Bool, self._spot_topic("lease_held"), 1
         )
         self._feedback_publisher = self.create_publisher(
             Feedback, self._spot_topic("status/feedback"), 1
@@ -159,6 +183,7 @@ class UnitySpotBridge(Node):
         self._stop_event = threading.Event()
         self._camera_client: Optional[socket.socket] = None
         self._control_client: Optional[socket.socket] = None
+        self._lidar_client: Optional[socket.socket] = None
         self._control_writer = None
         self._control_send_lock = threading.Lock()
         self._control_state_lock = threading.Lock()
@@ -166,9 +191,15 @@ class UnitySpotBridge(Node):
         self._pending: Dict[str, Tuple[threading.Event, Optional[Dict[str, Any]]]] = {}
         self._frame_count = 0
         self._report_started: Optional[float] = None
+        self._lidar_scan_count = 0
+        self._lidar_report_started: Optional[float] = None
+        self._lidar_mount: Optional[Tuple[float, ...]] = None
+        self._lidar_geometry: Optional[Tuple[float, ...]] = None
+        self._lidar_unit_vectors: Tuple[Tuple[float, float, float], ...] = ()
 
         self._camera_listener = self._create_listener(self._camera_port)
         self._control_listener = self._create_listener(self._control_port)
+        self._lidar_listener = self._create_listener(self._lidar_port)
         self._camera_thread = threading.Thread(
             target=self._serve_camera,
             name="unity-camera-tcp",
@@ -179,10 +210,21 @@ class UnitySpotBridge(Node):
             name="unity-spot-control-tcp",
             daemon=True,
         )
+        self._lidar_thread = threading.Thread(
+            target=self._serve_lidar,
+            name="unity-lidar-tcp",
+            daemon=True,
+        )
+        self._publish_static_transforms()
         self._camera_thread.start()
         self._control_thread.start()
-        self._lease_publisher.publish(Bool(data=False))
-        self._publish_static_transforms()
+        self._lidar_thread.start()
+        self._publish_lease_state(False)
+
+    def _publish_lease_state(self, has_lease: bool) -> None:
+        message = Bool(data=has_lease)
+        self._lease_publisher.publish(message)
+        self._lease_held_publisher.publish(message)
 
     def _get_vector_parameter(self, name: str) -> Tuple[float, float, float]:
         value = self.get_parameter(name).value
@@ -226,11 +268,12 @@ class UnitySpotBridge(Node):
             lamp_qz,
             lamp_qw,
         )
-        self._static_tf_broadcaster.sendTransform([map_to_tf_root, body_to_lamp])
-        self.get_logger().info(
-            f"Published static TFs: {self._map_frame_id}->{self._tf_root_frame_id()} "
-            f"and {self._body_frame_id}->{self._lamp_base_frame_id}"
-        )
+        self._base_static_transforms = [
+            map_to_tf_root,
+            body_to_lamp,
+        ]
+        self._static_tf_broadcaster.sendTransform(self._base_static_transforms)
+        self.get_logger().info("Published canonical map and LAMP static TFs")
 
     @staticmethod
     def _normalize_quaternion(
@@ -389,6 +432,226 @@ class UnitySpotBridge(Node):
                 )
                 self._report_started = now
 
+    def _serve_lidar(self) -> None:
+        self.get_logger().info(
+            f"Listening for Unity lidar scans on "
+            f"{self._listen_host}:{self._lidar_port}"
+        )
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    client, address = self._lidar_listener.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    if self._stop_event.is_set():
+                        break
+                    raise
+
+                self._lidar_client = client
+                client.settimeout(1.0)
+                self.get_logger().info(
+                    f"Unity lidar connected from {address[0]}:{address[1]}"
+                )
+                try:
+                    self._receive_lidar_scans(client)
+                except (InvalidFrameError, OSError) as error:
+                    self.get_logger().warning(
+                        f"Closing Unity lidar connection: {error}"
+                    )
+                finally:
+                    self._lidar_client = None
+                    self._close_socket(client)
+        finally:
+            self._close_socket(self._lidar_listener)
+
+    def _receive_lidar_scans(self, client: socket.socket) -> None:
+        while not self._stop_event.is_set():
+            frame_header = receive_exact(client, HEADER_SIZE)
+            if frame_header is None:
+                return
+
+            payload_size = struct.unpack("!I", frame_header)[0]
+            if payload_size < LIDAR_HEADER.size + 4:
+                raise InvalidFrameError(
+                    f"lidar payload size {payload_size} is too small"
+                )
+            if payload_size > self._max_lidar_payload_bytes:
+                raise InvalidFrameError(
+                    f"lidar payload size {payload_size} exceeds maximum "
+                    f"{self._max_lidar_payload_bytes}"
+                )
+
+            payload = receive_exact(client, payload_size)
+            if payload is None:
+                raise InvalidFrameError("connection closed before lidar payload")
+            self._publish_lidar_scan(payload)
+
+    def _publish_lidar_scan(self, payload: bytes) -> None:
+        (
+            magic,
+            version,
+            flags,
+            sequence,
+            horizontal_count,
+            vertical_count,
+            horizontal_min,
+            horizontal_increment,
+            vertical_min,
+            vertical_increment,
+            range_min,
+            range_max,
+            mount_x,
+            mount_y,
+            mount_z,
+            mount_qx,
+            mount_qy,
+            mount_qz,
+            mount_qw,
+        ) = LIDAR_HEADER.unpack_from(payload)
+        if magic != LIDAR_MAGIC:
+            raise InvalidFrameError(f"invalid lidar magic {magic!r}")
+        if version != LIDAR_VERSION:
+            raise InvalidFrameError(f"unsupported lidar version {version}")
+        if flags != 0:
+            raise InvalidFrameError(f"unsupported lidar flags {flags}")
+        if horizontal_count == 0 or vertical_count == 0:
+            raise InvalidFrameError("lidar dimensions must be positive")
+        if not all(
+            math.isfinite(value)
+            for value in (
+                horizontal_min,
+                horizontal_increment,
+                vertical_min,
+                vertical_increment,
+                range_min,
+                range_max,
+                mount_x,
+                mount_y,
+                mount_z,
+                mount_qx,
+                mount_qy,
+                mount_qz,
+                mount_qw,
+            )
+        ):
+            raise InvalidFrameError("lidar metadata contains non-finite values")
+        if horizontal_increment <= 0.0 or vertical_increment < 0.0:
+            raise InvalidFrameError("lidar angular increments are invalid")
+        if range_min <= 0.0 or range_max <= range_min:
+            raise InvalidFrameError("lidar range limits are invalid")
+
+        ray_count = horizontal_count * vertical_count
+        expected_size = LIDAR_HEADER.size + ray_count * 4
+        if len(payload) != expected_size:
+            raise InvalidFrameError(
+                f"lidar payload has {len(payload)} bytes; expected {expected_size}"
+            )
+
+        mount_qx, mount_qy, mount_qz, mount_qw = self._normalize_quaternion(
+            mount_qx, mount_qy, mount_qz, mount_qw
+        )
+        stamp = self.get_clock().now().to_msg()
+        mount = (
+            mount_x,
+            mount_y,
+            mount_z,
+            mount_qx,
+            mount_qy,
+            mount_qz,
+            mount_qw,
+        )
+        if mount != self._lidar_mount:
+            lidar_transform = self._make_transform(
+                stamp,
+                self._body_frame_id,
+                self._lidar_frame_id,
+                *mount,
+            )
+            self._static_tf_broadcaster.sendTransform(
+                [*self._base_static_transforms, lidar_transform]
+            )
+            self._lidar_mount = mount
+
+        geometry = (
+            horizontal_count,
+            vertical_count,
+            horizontal_min,
+            horizontal_increment,
+            vertical_min,
+            vertical_increment,
+        )
+        if geometry != self._lidar_geometry:
+            unit_vectors = []
+            for vertical_index in range(vertical_count):
+                elevation = vertical_min + vertical_index * vertical_increment
+                cos_elevation = math.cos(elevation)
+                sin_elevation = math.sin(elevation)
+                for horizontal_index in range(horizontal_count):
+                    azimuth = horizontal_min + horizontal_index * horizontal_increment
+                    unit_vectors.append(
+                        (
+                            cos_elevation * math.cos(azimuth),
+                            cos_elevation * math.sin(azimuth),
+                            sin_elevation,
+                        )
+                    )
+            self._lidar_unit_vectors = tuple(unit_vectors)
+            self._lidar_geometry = geometry
+
+        points = bytearray(ray_count * POINT_XYZ.size)
+        point_offset = 0
+        valid_points = 0
+        ranges = struct.iter_unpack("<f", payload[LIDAR_HEADER.size :])
+        for (distance,), unit_vector in zip(ranges, self._lidar_unit_vectors):
+            if not math.isfinite(distance):
+                continue
+            if distance < range_min or distance > range_max:
+                raise InvalidFrameError(
+                    f"lidar range {distance} outside [{range_min}, {range_max}]"
+                )
+
+            POINT_XYZ.pack_into(
+                points,
+                point_offset,
+                distance * unit_vector[0],
+                distance * unit_vector[1],
+                distance * unit_vector[2],
+            )
+            point_offset += POINT_XYZ.size
+            valid_points += 1
+
+        message = PointCloud2()
+        message.header.stamp = stamp
+        message.header.frame_id = self._lidar_frame_id
+        message.height = 1
+        message.width = valid_points
+        message.fields = [
+            PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1),
+            PointField(name="y", offset=4, datatype=PointField.FLOAT32, count=1),
+            PointField(name="z", offset=8, datatype=PointField.FLOAT32, count=1),
+        ]
+        message.is_bigendian = False
+        message.point_step = POINT_XYZ.size
+        message.row_step = valid_points * POINT_XYZ.size
+        message.data = points[:point_offset]
+        message.is_dense = True
+        self._lidar_publisher.publish(message)
+
+        self._lidar_scan_count += 1
+        now = time.monotonic()
+        if self._lidar_report_started is None:
+            self._lidar_report_started = now
+        if self._lidar_scan_count % 50 == 0:
+            elapsed = now - self._lidar_report_started
+            scan_intervals = 49 if self._lidar_scan_count == 50 else 50
+            scan_rate = scan_intervals / elapsed if elapsed > 0 else 0.0
+            self.get_logger().info(
+                f"lidar_scans={self._lidar_scan_count} sequence={sequence} "
+                f"points={valid_points}/{ray_count} rate_hz={scan_rate:.1f}"
+            )
+            self._lidar_report_started = now
+
     def _serve_control(self) -> None:
         self.get_logger().info(
             f"Listening for Unity Spot control/state on "
@@ -436,7 +699,7 @@ class UnitySpotBridge(Node):
                         pass
                     self._close_socket(client)
                     self._fail_pending("Unity control connection closed")
-                    self._lease_publisher.publish(Bool(data=False))
+                    self._publish_lease_state(False)
         finally:
             self._close_socket(self._control_listener)
 
@@ -529,9 +792,7 @@ class UnitySpotBridge(Node):
         powered_on = bool(state.get("powered_on", False))
         standing = bool(state.get("standing", False))
         moving = abs(vx) > 0.01 or abs(vy) > 0.01 or abs(wz) > 0.01
-        self._lease_publisher.publish(
-            Bool(data=has_lease)
-        )
+        self._publish_lease_state(has_lease)
         feedback = Feedback()
         feedback.standing = standing
         feedback.sitting = not standing
@@ -624,7 +885,7 @@ class UnitySpotBridge(Node):
         def callback(_request: Trigger.Request, response: Trigger.Response):
             response.success, response.message = self._send_command(command)
             if response.success and command in ("claim", "release"):
-                self._lease_publisher.publish(Bool(data=command == "claim"))
+                self._publish_lease_state(command == "claim")
             return response
 
         return callback
@@ -693,13 +954,19 @@ class UnitySpotBridge(Node):
         for sock in (
             self._camera_client,
             self._control_client,
+            self._lidar_client,
             self._camera_listener,
             self._control_listener,
+            self._lidar_listener,
         ):
             if sock is not None:
                 self._close_socket(sock)
         self._fail_pending("Bridge is shutting down")
-        for thread in (self._camera_thread, self._control_thread):
+        for thread in (
+            self._camera_thread,
+            self._control_thread,
+            self._lidar_thread,
+        ):
             if thread.is_alive():
                 thread.join(timeout=2.0)
 
