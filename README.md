@@ -37,6 +37,14 @@ lidar scans on port 50053. Defaults are:
   Unity's perfect `map -> spot/lidar` transform and publishes a persistent
   `nav_msgs/msg/OccupancyGrid` on `/map`. This provides Cartographer-compatible
   map output without running a second localization estimate in the simulation.
+- Radiation sources: every enabled Unity `RadiationSource` component is sent as
+  part of a complete scene snapshot and published on
+  `/simulation/radiation_sources` as
+  `mfdf_ros2_msgs/msg/SimulatedSourceArray`. Source poses are in `map`, sources
+  may move, and the snapshot also carries the scene-wide background count rate.
+  The ROS synthetic forward projector applies isotope gamma lines, branching
+  ratios, detector geometry, angular response, attenuation, counting noise, and
+  energy response before publishing `/interaction_data_synth`.
 
 `take_lease` maps to Unity's internal `claim` command so the ROS API matches
 the real Spot driver while the Unity scene can keep its local naming.

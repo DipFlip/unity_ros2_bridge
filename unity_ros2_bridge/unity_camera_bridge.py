@@ -9,9 +9,15 @@ from typing import Any, Dict, Optional, Tuple
 
 import rclpy
 from geometry_msgs.msg import TransformStamped, Twist, TwistWithCovarianceStamped
+from mfdf_ros2_msgs.msg import SimulatedSource, SimulatedSourceArray
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
-from rclpy.qos import QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
+from rclpy.qos import (
+    QoSDurabilityPolicy,
+    QoSHistoryPolicy,
+    QoSProfile,
+    QoSReliabilityPolicy,
+)
 from sensor_msgs.msg import CompressedImage, PointCloud2, PointField
 from spot_msgs.msg import Feedback, PowerState
 from std_msgs.msg import Bool
@@ -67,6 +73,9 @@ class UnitySpotBridge(Node):
         self.declare_parameter("tf_root", "odom")
         self.declare_parameter("map_frame_id", "map")
         self.declare_parameter("lamp_base_frame_id", "lamp_base_link")
+        self.declare_parameter(
+            "radiation_source_topic", "/simulation/radiation_sources"
+        )
         self.declare_parameter("lamp_mount_xyz", [0.0, 0.0, 0.25])
         self.declare_parameter("lamp_mount_rpy", [math.pi, 0.0, 0.0])
         self.declare_parameter("max_payload_bytes", 5 * 1024 * 1024)
@@ -98,6 +107,9 @@ class UnitySpotBridge(Node):
         self._lamp_base_frame_id = str(
             self.get_parameter("lamp_base_frame_id").value
         ).lstrip("/")
+        self._radiation_source_topic = str(
+            self.get_parameter("radiation_source_topic").value
+        )
         self._lamp_mount_xyz = self._get_vector_parameter("lamp_mount_xyz")
         self._lamp_mount_rpy = self._get_vector_parameter("lamp_mount_rpy")
         self._max_payload_bytes = int(
@@ -155,6 +167,15 @@ class UnitySpotBridge(Node):
         )
         self._power_publisher = self.create_publisher(
             PowerState, self._spot_topic("status/power_states"), 1
+        )
+        source_qos = QoSProfile(
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self._radiation_source_publisher = self.create_publisher(
+            SimulatedSourceArray, self._radiation_source_topic, source_qos
         )
         self._tf_broadcaster = TransformBroadcaster(self)
         self._static_tf_broadcaster = StaticTransformBroadcaster(self)
@@ -708,6 +729,8 @@ class UnitySpotBridge(Node):
         message_type = message.get("type")
         if message_type == "pose":
             self._publish_pose(message)
+        elif message_type == "radiation_sources":
+            self._publish_radiation_sources(message)
         elif message_type == "response":
             request_id = str(message.get("id", ""))
             with self._pending_lock:
@@ -715,6 +738,67 @@ class UnitySpotBridge(Node):
                 if pending is not None:
                     self._pending[request_id] = (pending[0], message)
                     pending[0].set()
+
+    def _publish_radiation_sources(self, state: Dict[str, Any]) -> None:
+        raw_sources = state.get("sources")
+        if not isinstance(raw_sources, list):
+            raise ValueError("radiation_sources.sources must be a list")
+        if len(raw_sources) > 256:
+            raise ValueError("radiation source snapshot exceeds 256 sources")
+
+        message = SimulatedSourceArray()
+        message.header.stamp = self.get_clock().now().to_msg()
+        message.header.frame_id = self._map_frame_id
+        message.sequence = int(state.get("sequence", 0))
+        message.background_rate_per_detector = float(
+            state.get("background_rate_per_detector", 0.0)
+        )
+        if (
+            not math.isfinite(message.background_rate_per_detector)
+            or message.background_rate_per_detector < 0
+        ):
+            raise ValueError("invalid radiation background rate")
+
+        source_ids = set()
+        for raw_source in raw_sources:
+            if not isinstance(raw_source, dict):
+                raise ValueError("each radiation source must be an object")
+            source_id = str(raw_source.get("id", "")).strip()
+            isotope = str(raw_source.get("isotope", "")).strip()
+            activity_bq = float(raw_source.get("activity_bq", 0.0))
+            if not source_id or source_id in source_ids:
+                raise ValueError(f"invalid or duplicate radiation source id: {source_id}")
+            if not isotope:
+                raise ValueError(f"source {source_id} has no isotope")
+            if not math.isfinite(activity_bq) or activity_bq < 0:
+                raise ValueError(f"source {source_id} has invalid activity")
+            source_ids.add(source_id)
+
+            source = SimulatedSource()
+            source.id = source_id
+            source.isotope = isotope
+            source.activity_bq = activity_bq
+            source.pose.position.x = float(raw_source.get("x", 0.0))
+            source.pose.position.y = float(raw_source.get("y", 0.0))
+            source.pose.position.z = float(raw_source.get("z", 0.0))
+            source.pose.orientation.x = float(raw_source.get("qx", 0.0))
+            source.pose.orientation.y = float(raw_source.get("qy", 0.0))
+            source.pose.orientation.z = float(raw_source.get("qz", 0.0))
+            source.pose.orientation.w = float(raw_source.get("qw", 1.0))
+            pose_values = (
+                source.pose.position.x,
+                source.pose.position.y,
+                source.pose.position.z,
+                source.pose.orientation.x,
+                source.pose.orientation.y,
+                source.pose.orientation.z,
+                source.pose.orientation.w,
+            )
+            if not all(math.isfinite(value) for value in pose_values):
+                raise ValueError(f"source {source_id} has an invalid pose")
+            message.sources.append(source)
+
+        self._radiation_source_publisher.publish(message)
 
     def _state_quaternion(self, state: Dict[str, Any]) -> Tuple[float, float, float, float]:
         if "qw" in state:
