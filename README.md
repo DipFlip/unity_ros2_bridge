@@ -28,7 +28,14 @@ lidar scans on port 50053. Defaults are:
   costmap uses `spot/odom`. `lamp_base_link` is fixed to Spot's body with the
   standard Spot LAMP mount (`xyz=[0,0,0.25]`, `rpy=[pi,0,0]`). Set `tf_root`
   to `vision` or `body` to invert the Spot subtree the same way the driver does.
-- Camera: `/spot/camera/image/compressed`.
+- Front-left camera: synchronized RGB-D and calibration on
+  `/spot/camera/frontleft/image`, `/spot/depth_registered/frontleft/image`, and
+  `/spot/camera/frontleft/camera_info`, with the optical TF
+  `spot/body -> spot/camera/frontleft_optical_frame`. The legacy UI stream is
+  retained on `/spot/camera/image/compressed`; the named compressed stream is
+  `/spot/camera/frontleft/image/compressed`. The camera TCP packet contains the
+  JPEG, registered 16-bit millimeter depth, intrinsics, and mount together so
+  their timestamps cannot diverge.
 - Lidar: `/spot/nav2_points_fused` (`sensor_msgs/msg/PointCloud2`, best effort,
   `spot/lidar` frame). Unity sends packed ranges and the `Lidar` GameObject's
   body-relative pose; the bridge reconstructs XYZ points and publishes the
