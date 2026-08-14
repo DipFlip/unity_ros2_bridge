@@ -5,6 +5,7 @@ import struct
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
 import cv2
@@ -38,6 +39,22 @@ POINT_XYZ = struct.Struct("<fff")
 
 class InvalidFrameError(Exception):
     pass
+
+
+@dataclass(frozen=True)
+class RgbdFrame:
+    sequence: int
+    width: int
+    height: int
+    fx: float
+    fy: float
+    cx: float
+    cy: float
+    near_clip: float
+    far_clip: float
+    mount: Tuple[float, float, float, float, float, float, float]
+    jpeg: bytes
+    depth: bytes
 
 
 def receive_exact(client: socket.socket, size: int) -> Optional[bytes]:
@@ -88,6 +105,7 @@ class UnitySpotBridge(Node):
         self.declare_parameter("max_payload_bytes", 5 * 1024 * 1024)
         self.declare_parameter("max_lidar_payload_bytes", 1024 * 1024)
         self.declare_parameter("command_timeout_seconds", 2.0)
+        self.declare_parameter("rgbd_publish_rate_hz", 1.0)
 
         self._listen_host = str(self.get_parameter("listen_host").value)
         self._camera_port = int(self.get_parameter("camera_port").value)
@@ -129,12 +147,20 @@ class UnitySpotBridge(Node):
         self._command_timeout = float(
             self.get_parameter("command_timeout_seconds").value
         )
+        self._rgbd_publish_rate_hz = float(
+            self.get_parameter("rgbd_publish_rate_hz").value
+        )
         if self._max_payload_bytes <= 0:
             raise ValueError("max_payload_bytes must be positive")
         if self._max_lidar_payload_bytes < LIDAR_HEADER.size + 4:
             raise ValueError("max_lidar_payload_bytes is too small for one ray")
         if self._command_timeout <= 0:
             raise ValueError("command_timeout_seconds must be positive")
+        if (
+            not math.isfinite(self._rgbd_publish_rate_hz)
+            or self._rgbd_publish_rate_hz <= 0
+        ):
+            raise ValueError("rgbd_publish_rate_hz must be finite and positive")
         if self._tf_root not in ("odom", "vision", "body"):
             raise ValueError("tf_root must be one of: odom, vision, body")
         if not self._map_frame_id:
@@ -157,25 +183,20 @@ class UnitySpotBridge(Node):
         self._camera_publisher = self.create_publisher(
             CompressedImage, camera_topic, best_effort_qos
         )
-        reliable_sensor_qos = QoSProfile(
-            history=QoSHistoryPolicy.KEEP_LAST,
-            depth=1,
-            reliability=QoSReliabilityPolicy.RELIABLE,
-        )
         camera_prefix = self._spot_topic(f"camera/{self._camera_name}")
         self._named_camera_compressed_publisher = self.create_publisher(
             CompressedImage, f"{camera_prefix}/image/compressed", best_effort_qos
         )
         self._camera_image_publisher = self.create_publisher(
-            Image, f"{camera_prefix}/image", reliable_sensor_qos
+            Image, f"{camera_prefix}/image", best_effort_qos
         )
         self._camera_info_publisher = self.create_publisher(
-            CameraInfo, f"{camera_prefix}/camera_info", reliable_sensor_qos
+            CameraInfo, f"{camera_prefix}/camera_info", best_effort_qos
         )
         self._camera_depth_publisher = self.create_publisher(
             Image,
             self._spot_topic(f"depth_registered/{self._camera_name}/image"),
-            reliable_sensor_qos,
+            best_effort_qos,
         )
         self._lidar_publisher = self.create_publisher(
             PointCloud2, self._spot_topic("nav2_points_fused"), best_effort_qos
@@ -232,6 +253,8 @@ class UnitySpotBridge(Node):
             )
 
         self._stop_event = threading.Event()
+        self._rgbd_condition = threading.Condition()
+        self._latest_rgbd_frame: Optional[Tuple[bytes, Any]] = None
         self._camera_client: Optional[socket.socket] = None
         self._control_client: Optional[socket.socket] = None
         self._lidar_client: Optional[socket.socket] = None
@@ -259,6 +282,11 @@ class UnitySpotBridge(Node):
             name="unity-camera-tcp",
             daemon=True,
         )
+        self._rgbd_thread = threading.Thread(
+            target=self._serve_latest_rgbd,
+            name="unity-camera-rgbd",
+            daemon=True,
+        )
         self._control_thread = threading.Thread(
             target=self._serve_control,
             name="unity-spot-control-tcp",
@@ -271,6 +299,7 @@ class UnitySpotBridge(Node):
         )
         self._publish_static_transforms()
         self._camera_thread.start()
+        self._rgbd_thread.start()
         self._control_thread.start()
         self._lidar_thread.start()
         self._publish_lease_state(False)
@@ -513,6 +542,50 @@ class UnitySpotBridge(Node):
         self._named_camera_compressed_publisher.publish(message)
 
     def _publish_rgbd_frame(self, payload: bytes) -> Tuple[int, int, int]:
+        """Publish the low-latency JPEG and replace the pending RGB-D frame."""
+        frame = self._parse_rgbd_frame(payload)
+
+        stamp = self.get_clock().now().to_msg()
+        compressed = CompressedImage()
+        compressed.header.stamp = stamp
+        compressed.header.frame_id = self._camera_frame_id
+        compressed.format = "jpeg"
+        compressed.data = frame.jpeg
+        self._camera_publisher.publish(compressed)
+        self._named_camera_compressed_publisher.publish(compressed)
+
+        mount_x, mount_y, mount_z, mount_qx, mount_qy, mount_qz, mount_qw = (
+            frame.mount
+        )
+        mount_qx, mount_qy, mount_qz, mount_qw = self._normalize_quaternion(
+            mount_qx, mount_qy, mount_qz, mount_qw
+        )
+        mount = (
+            mount_x,
+            mount_y,
+            mount_z,
+            mount_qx,
+            mount_qy,
+            mount_qz,
+            mount_qw,
+        )
+        if mount != self._camera_mount:
+            self._camera_transform = self._make_transform(
+                stamp,
+                self._body_frame_id,
+                self._camera_frame_id,
+                *mount,
+            )
+            self._publish_all_static_transforms()
+            self._camera_mount = mount
+
+        with self._rgbd_condition:
+            self._latest_rgbd_frame = (payload, stamp)
+            self._rgbd_condition.notify()
+
+        return frame.sequence, len(frame.jpeg), len(frame.depth)
+
+    def _parse_rgbd_frame(self, payload: bytes) -> RgbdFrame:
         if len(payload) < CAMERA_HEADER.size:
             raise InvalidFrameError(
                 f"camera payload has {len(payload)} bytes; header requires "
@@ -586,81 +659,126 @@ class UnitySpotBridge(Node):
         jpeg_end = jpeg_start + jpeg_size
         jpeg = payload[jpeg_start:jpeg_end]
         depth = payload[jpeg_end:]
-        decoded = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+        return RgbdFrame(
+            sequence=sequence,
+            width=width,
+            height=height,
+            fx=fx,
+            fy=fy,
+            cx=cx,
+            cy=cy,
+            near_clip=near_clip,
+            far_clip=far_clip,
+            mount=(
+                mount_x,
+                mount_y,
+                mount_z,
+                mount_qx,
+                mount_qy,
+                mount_qz,
+                mount_qw,
+            ),
+            jpeg=jpeg,
+            depth=depth,
+        )
+
+    def _serve_latest_rgbd(self) -> None:
+        """Publish at most one raw RGB-D pair per interval, always the newest."""
+        interval = 1.0 / self._rgbd_publish_rate_hz
+        next_publish_time = time.monotonic()
+        while not self._stop_event.is_set():
+            with self._rgbd_condition:
+                while self._latest_rgbd_frame is None and not self._stop_event.is_set():
+                    self._rgbd_condition.wait(timeout=1.0)
+                if self._stop_event.is_set():
+                    return
+
+                delay = next_publish_time - time.monotonic()
+                if delay > 0:
+                    self._rgbd_condition.wait(timeout=delay)
+                    continue
+
+                payload, stamp = self._latest_rgbd_frame
+                self._latest_rgbd_frame = None
+
+            try:
+                self._publish_raw_rgbd(payload, stamp)
+            except InvalidFrameError as error:
+                self.get_logger().error(
+                    f"Dropping invalid latest RGB-D frame: {error}"
+                )
+            next_publish_time = time.monotonic() + interval
+
+    def _publish_raw_rgbd(self, payload: bytes, stamp: Any) -> None:
+        frame = self._parse_rgbd_frame(payload)
+
+        decoded = cv2.imdecode(
+            np.frombuffer(frame.jpeg, dtype=np.uint8), cv2.IMREAD_COLOR
+        )
         if decoded is None:
             raise InvalidFrameError("camera JPEG could not be decoded")
-        if decoded.shape[:2] != (height, width):
+        if decoded.shape[:2] != (frame.height, frame.width):
             raise InvalidFrameError(
                 f"camera JPEG is {decoded.shape[1]}x{decoded.shape[0]}; "
-                f"metadata says {width}x{height}"
+                f"metadata says {frame.width}x{frame.height}"
             )
-
-        stamp = self.get_clock().now().to_msg()
-        compressed = CompressedImage()
-        compressed.header.stamp = stamp
-        compressed.header.frame_id = self._camera_frame_id
-        compressed.format = "jpeg"
-        compressed.data = jpeg
-        self._camera_publisher.publish(compressed)
-        self._named_camera_compressed_publisher.publish(compressed)
 
         image = Image()
         image.header.stamp = stamp
         image.header.frame_id = self._camera_frame_id
-        image.height = height
-        image.width = width
+        image.height = frame.height
+        image.width = frame.width
         image.encoding = "bgr8"
         image.is_bigendian = False
-        image.step = width * 3
+        image.step = frame.width * 3
         image.data = decoded.tobytes()
         self._camera_image_publisher.publish(image)
 
         depth_image = Image()
         depth_image.header.stamp = stamp
         depth_image.header.frame_id = self._camera_frame_id
-        depth_image.height = height
-        depth_image.width = width
+        depth_image.height = frame.height
+        depth_image.width = frame.width
         depth_image.encoding = "16UC1"
         depth_image.is_bigendian = False
-        depth_image.step = width * 2
-        depth_image.data = depth
+        depth_image.step = frame.width * 2
+        depth_image.data = frame.depth
         self._camera_depth_publisher.publish(depth_image)
 
         info = CameraInfo()
         info.header.stamp = stamp
         info.header.frame_id = self._camera_frame_id
-        info.height = height
-        info.width = width
+        info.height = frame.height
+        info.width = frame.width
         info.distortion_model = "plumb_bob"
         info.d = [0.0] * 5
-        info.k = [fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0]
+        info.k = [
+            frame.fx,
+            0.0,
+            frame.cx,
+            0.0,
+            frame.fy,
+            frame.cy,
+            0.0,
+            0.0,
+            1.0,
+        ]
         info.r = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
-        info.p = [fx, 0.0, cx, 0.0, 0.0, fy, cy, 0.0, 0.0, 0.0, 1.0, 0.0]
+        info.p = [
+            frame.fx,
+            0.0,
+            frame.cx,
+            0.0,
+            0.0,
+            frame.fy,
+            frame.cy,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+        ]
         self._camera_info_publisher.publish(info)
-
-        mount_qx, mount_qy, mount_qz, mount_qw = self._normalize_quaternion(
-            mount_qx, mount_qy, mount_qz, mount_qw
-        )
-        mount = (
-            mount_x,
-            mount_y,
-            mount_z,
-            mount_qx,
-            mount_qy,
-            mount_qz,
-            mount_qw,
-        )
-        if mount != self._camera_mount:
-            self._camera_transform = self._make_transform(
-                stamp,
-                self._body_frame_id,
-                self._camera_frame_id,
-                *mount,
-            )
-            self._publish_all_static_transforms()
-            self._camera_mount = mount
-
-        return sequence, jpeg_size, depth_size
 
     def _serve_lidar(self) -> None:
         self.get_logger().info(
@@ -1242,6 +1360,8 @@ class UnitySpotBridge(Node):
 
     def stop(self) -> None:
         self._stop_event.set()
+        with self._rgbd_condition:
+            self._rgbd_condition.notify_all()
         for sock in (
             self._camera_client,
             self._control_client,
@@ -1255,6 +1375,7 @@ class UnitySpotBridge(Node):
         self._fail_pending("Bridge is shutting down")
         for thread in (
             self._camera_thread,
+            self._rgbd_thread,
             self._control_thread,
             self._lidar_thread,
         ):

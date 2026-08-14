@@ -35,7 +35,10 @@ lidar scans on port 50053. Defaults are:
   retained on `/spot/camera/image/compressed`; the named compressed stream is
   `/spot/camera/frontleft/image/compressed`. The camera TCP packet contains the
   JPEG, registered 16-bit millimeter depth, intrinsics, and mount together so
-  their timestamps cannot diverge.
+  their timestamps cannot diverge. Compressed frames are forwarded immediately;
+  raw RGB-D publication uses a latest-frame-only worker at 1 Hz by default so
+  slow perception cannot add latency to the UI stream. Configure that rate with
+  the `rgbd_publish_rate_hz` parameter.
 - Lidar: `/spot/nav2_points_fused` (`sensor_msgs/msg/PointCloud2`, best effort,
   `spot/lidar` frame). Unity sends packed ranges and the `Lidar` GameObject's
   body-relative pose; the bridge reconstructs XYZ points and publishes the
