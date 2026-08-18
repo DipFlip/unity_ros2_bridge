@@ -243,6 +243,7 @@ class UnitySpotBridge(Node):
             ("stand", "stand"),
             ("sit", "sit"),
             ("stop", "stop"),
+            ("sim_reset", "reset"),
         ):
             self._services.append(
                 self.create_service(
